@@ -9,6 +9,18 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// API token check for every /scan route (added for the CI/CD pipeline)
+const API_TOKEN = process.env.API_TOKEN;
+app.use('/scan', (req, res, next) => {
+  if (!API_TOKEN) {
+    return res.status(503).json({ error: 'Scanner has no API token configured' });
+  }
+  if (req.get('Authorization') !== `Bearer ${API_TOKEN}`) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
