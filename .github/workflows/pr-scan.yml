@@ -1,0 +1,95 @@
+name: PR security scan
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  sast-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SCANNER_URL: ${{ secrets.SCANNER_URL }}
+      SCANNER_TOKEN: ${{ secrets.SCANNER_TOKEN }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Find changed JavaScript files
+        id: files
+        run: |
+          git diff --name-only --diff-filter=ACMR \
+            "origin/${{ github.base_ref }}...HEAD" -- '*.js' \
+            > changed.txt || true
+          echo "Changed JavaScript files:"
+          cat changed.txt
+          echo "count=$(wc -l < changed.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Check that the scanner is reachable
+        if: steps.files.outputs.count != '0'
+        run: |
+          if ! curl -sf --max-time 10 --retry 2 \
+               "$SCANNER_URL/health" > /dev/null; then
+            msg="Scanner unavailable. This is not a vulnerability result."
+            echo "::error::$msg"
+            echo "### Scanner unavailable" >> "$GITHUB_STEP_SUMMARY"
+            echo "$msg Re-run the check when the scanner is back." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Scan changed files
+        if: steps.files.outputs.count != '0'
+        run: |
+          mkdir -p reports
+          high_total=0
+          {
+            echo "## SAST scan results"
+            echo "| File | High | Medium | Low |"
+            echo "| --- | --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while read -r file; do
+            body=$(jq -n --rawfile code "$file" --arg name "$file" \
+              '{code: $code, filename: $name}')
+            status=$(curl -s -o result.json -w "%{http_code}" \
+              --max-time 30 -X POST "$SCANNER_URL/scan/code" \
+              -H "Authorization: Bearer $SCANNER_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$body" || true)
+            if [ "$status" = "000" ]; then
+              echo "::error::Scanner unavailable while scanning $file"
+              exit 1
+            elif [ "$status" = "401" ]; then
+              echo "::error::Scanner rejected the token. Check SCANNER_TOKEN."
+              exit 1
+            elif [ "$status" != "200" ]; then
+              echo "::error::Scanner returned HTTP $status for $file"
+              exit 1
+            fi
+            cp result.json "reports/$(echo "$file" | tr '/' '_').json"
+            high=$(jq '.summary.high' result.json)
+            medium=$(jq '.summary.medium' result.json)
+            low=$(jq '.summary.low' result.json)
+            echo "| $file | $high | $medium | $low |" >> "$GITHUB_STEP_SUMMARY"
+            jq -r --arg f "$file" \
+              '.vulnerabilities[] | "\(.severity) \($f):\(.line) \(.name)"' \
+              result.json
+            high_total=$((high_total + high))
+          done < changed.txt
+          if [ "$high_total" -gt 0 ]; then
+            echo "::error::Found $high_total high-severity issue(s)."
+            echo "**Merge blocked:** $high_total high-severity issue(s)." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "**Passed:** no high-severity issues." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scan reports
+        if: always() && steps.files.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: reports/
+          if-no-files-found: ignore
