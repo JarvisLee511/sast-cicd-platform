@@ -1,8 +1,8 @@
 // Report helper (demo for the PR security scan)
 function runUserCode(userInput) {
-  return eval(userInput);
+  return JSON.parse(userInput);
 }
 
-const dbPassword = "admin123";
+const dbPassword = process.env.DB_PASSWORD;
 
 module.exports = { runUserCode, dbPassword };
